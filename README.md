@@ -7,7 +7,7 @@ Lycatra OS is a modular studio desktop for Omarchy. Super+Space searches install
 The first distribution is a preview for Omarchy 4.5.0-3. To test a published preview, set `LYCATRA_DESKTOP_RELEASE` to its exact tag. The bootstrap verifies a Sigstore signature from the release workflow in this repository using GitHub OIDC before unpacking the archive.
 
 ```bash
-LYCATRA_DESKTOP_RELEASE=v0.1.0-preview.1 bash <(curl -fsSL https://raw.githubusercontent.com/Lycatra/lycatra-OS/v0.1.0-preview.1/release/bootstrap.sh)
+LYCATRA_DESKTOP_RELEASE=v0.1.0-preview.2 bash <(curl -fsSL https://raw.githubusercontent.com/Lycatra/lycatra-OS/v0.1.0-preview.2/release/bootstrap.sh)
 ```
 
 ## Install from this checkout
@@ -21,7 +21,17 @@ Run `./install.sh` and select components. For unattended setup use `./install.sh
 3. Run `./install.sh COMPONENT...`, then `lycatra-desktop verify --json`. Ask the person to try Super+Space, a file, a command and a wiki page. Use `lycatra-desktop status` to monitor the first crawl. For a staging home use `--stage` to install files without starting services, downloading a model or enabling plugins.
 4. Offer wiki search after signing in to the Lycatra CLI and the Lycatra web app. Explain that ordinary search phrases will be sent to Lycatra when this is enabled. Enable with `lycatra-desktop configure --wiki on`; disable with `--wiki off`. A `files:` prefix keeps the query on the computer. `wiki:` searches only the wiki. The web app uses the existing Omarchy launcher and browser profile. Changing the CLI sign-in clears visible wiki results and requires a new opt-in.
 5. Pair the user's own phone through KDE Connect. The phone panel supports normal paired devices without ADB. For optional call controls, configure LYCATRA_PHONE_ID, LYCATRA_PHONE_ADB and LYCATRA_PHONE_BLUETOOTH in the shell session environment using the user's own device. The remotePhones panel setting maps paired device IDs to screen-mirroring endpoints. Dictation requires the user to choose a microphone and complete any provider sign-in.
-6. Run `lycatra-desktop apply COMPONENT...` to add features, `remove COMPONENT...` to uninstall, and `rollback` to restore the last file transaction. `update` reapplies the installed release. Install a newly verified release to upgrade the management tool. Keep the signed previous release for a manager downgrade. Existing local edits cause the operation to stop and list conflicts.
+6. Run `lycatra-desktop apply COMPONENT...` to add features, `remove COMPONENT...` to uninstall, and `rollback` to restore the last file transaction. `update` downloads and verifies the newest release in the current channel. Use `update --channel stable` or `update --channel preview` to select a channel. Rollback restores the previous managed files and manager version. Existing local edits cause the operation to stop and list conflicts.
+
+## Search settings
+
+Press **Super+Space**, type **Search settings**, and press Enter. The same controls are under **Setup → Search settings** and available with `lycatra-desktop settings`.
+
+Choose which Omarchy applications and commands appear alongside files and wiki pages. **Local files and folders** controls on-device search and indexing. **Local semantic matches** enables passage retrieval alongside filename and keyword search. **Offline mode** suppresses wiki requests. Wiki search requires a separate opt-in for the signed-in account.
+
+Agents can apply these switches with `lycatra-desktop configure --help`.
+
+Choose **Embedding model** to select multilingual E5 Small or the smaller, English-only quantized E5 Small v2. The model worker verifies the download and builds an independent index before switching. The current model continues serving searches during preparation. Open **Index status** to see progress, and use **Indexed folders**, **Excluded folders**, or **Pause indexing** to control coverage.
 
 ## Index coverage and privacy
 

@@ -1,12 +1,29 @@
 --- Menu.qml
 +++ Menu.qml
-@@ -747,6 +747,27 @@
+@@ -298,7 +298,10 @@
+     // "Go" label comes from the catalog's root entry; the merge only uses
+     // it for the injected row, never over a user-supplied heading.
+     var rootCatalog = root.menuCatalog.root
+-    var mergedMenu = MenuModel.mergeMenuSources(translatedDefaults, root.userMenuItems, rootCatalog && rootCatalog.label)
++    var settingsEntry = MenuModel.readMenuJsonc(JSON.stringify({
++      "setup.search-settings": {label: "Search settings", aliases: ["search-settings"], action: Util.shellQuote(root.desktopTool) + " settings"}
++    }))
++    var mergedMenu = MenuModel.mergeMenuSources(translatedDefaults.concat(settingsEntry), root.userMenuItems, rootCatalog && rootCatalog.label)
+     root.providerRevision += 1
+     root.providersLoaded = ({})
+     root.providerQueue = []
+@@ -747,6 +750,32 @@
          for (var d = 0; d < drilldownRows.length; d++) drilldownRows[d].section = "drilldown"
        }
        rows = currentRows.concat(drilldownRows)
 +      if (root.desktopQuery) {
++        rows = rows.filter(r => r.itemId === "setup.search-settings" ||
++          (r.kind === "app" ? root.desktopPreferences.apps !== false : root.desktopPreferences.commands !== false))
 +        var seen = new Map()
 +        for (var stage of ["lexical","wiki","semantic"]) {
++          if (stage === "wiki" && (!desktopPreferences.wiki || desktopPreferences.offline_only)) continue
++          if (stage !== "wiki" && desktopPreferences.local === false) continue
++          if (stage === "semantic" && desktopPreferences.semantic === false) continue
 +          var hits = root.desktopHits[stage] || []
 +          for (var n=0; n<hits.length; n++) {
 +            var hit=hits[n], id=hit.kind+"|"+hit.target
@@ -28,12 +45,26 @@
      } else {
        for (var j = 0; j < root.itemOrder.length; j++) {
          var child = root.item(root.itemOrder[j])
-@@ -816,6 +837,56 @@
+@@ -816,6 +845,74 @@
      selectedIndex = target
      revealCursor()
    }
 +
 +
++  property var desktopPreferences: ({})
++  FileView {
++    id: desktopConfig
++    path: (Quickshell.env("XDG_CONFIG_HOME") || Quickshell.env("HOME") + "/.config") + "/lycatra-desktop/search.json"
++    watchChanges: true
++    onFileChanged: reload()
++    onLoaded: {
++      try { root.desktopPreferences = JSON.parse(text()) } catch (e) { return }
++      root.desktopHits = ({})
++      root.rebuildDisplay()
++      fastSearch.restart()
++      deepSearch.restart()
++    }
++  }
 +  property string desktopQuery: opened && activeMenu === "root" && !dmenuActive ? filterText.trim() : ""
 +  property var desktopHits: ({})
 +  readonly property string desktopTool: Quickshell.env("HOME") + "/.local/bin/lycatra-desktop"
@@ -61,6 +92,10 @@
 +    property string requested
 +    function start() {
 +      if (!root.desktopQuery || running) return
++      var prefs = root.desktopPreferences
++      if (stage === "wiki" && (!prefs.wiki || prefs.offline_only || root.desktopQuery.startsWith("files:"))) return
++      if (stage !== "wiki" && (prefs.local === false || root.desktopQuery.startsWith("wiki:"))) return
++      if (stage === "semantic" && prefs.semantic === false) return
 +      requested = root.desktopQuery
 +      command = [root.desktopTool, "query", stage, "--", requested]
 +      running = true
@@ -85,7 +120,7 @@
  
    function setFilter(nextFilter) {
      panel.freezeCardTop()
-@@ -888,7 +959,11 @@
+@@ -888,7 +985,11 @@
      if (!root.rowSelectable(index)) return
  
      var row = displayModel.get(index)

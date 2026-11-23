@@ -1,0 +1,6 @@
+[Unit]
+Description=Watch Omarchy menu compatibility
+PartOf=lycatra-search.service
+[Path]
+PathChanged=/usr/share/omarchy/shell/plugins/menu/Menu.qml
+Unit=lycatra-menu-compat.service

@@ -86,7 +86,7 @@ class Desktop(unittest.TestCase):
         self.cli("configure", "--wiki", "on", ok=False)
         auth = self.home / ".config/lycatra/auth.json"
         auth.parent.mkdir(parents=True)
-        auth.write_text("{}")
+        auth.write_text('{"user":{"id":"example"}}')
         self.cli("configure", "--wiki", "on")
         self.assertEqual(self.cli("query", "wiki", "files: invoice"), [])
         self.assertFalse(flag.exists())

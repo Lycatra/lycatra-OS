@@ -22,6 +22,8 @@ import zipfile
 from pathlib import Path
 from xml.etree import ElementTree
 
+import models
+
 HOME = Path.home()
 STATE = Path(os.getenv("XDG_STATE_HOME", HOME / ".local/state")) / "lycatra-desktop"
 CONFIG = (
@@ -87,9 +89,20 @@ def eligible(path, cfg, *, walking=False):
     )
 
 
-def connect():
+def database(name=None):
+    name = name or settings().get("model", models.DEFAULT)
+    if name not in models.MODELS:
+        raise ValueError("Unknown index model")
+    return STATE / (
+        "search-v1.db" if name == models.DEFAULT else "search-" + name + ".db"
+    )
+
+
+def connect(name=None):
     STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
-    return sqlite3.connect(STATE / "search-v1.db", timeout=15)
+    db = sqlite3.connect(database(name), timeout=15)
+    db.execute("PRAGMA secure_delete=ON")
+    return db
 
 
 def initialize(db):
@@ -98,6 +111,7 @@ def initialize(db):
     PRAGMA secure_delete=ON;
     CREATE TABLE IF NOT EXISTS files(id INTEGER PRIMARY KEY,path TEXT UNIQUE,stamp TEXT,done INTEGER DEFAULT 0);
     CREATE VIRTUAL TABLE IF NOT EXISTS words USING fts5(path,body,tokenize='unicode61');
+    INSERT INTO words(words,rank) VALUES('secure-delete',1);
     CREATE TABLE IF NOT EXISTS passages(file INTEGER,text TEXT,vector BLOB);
     CREATE INDEX IF NOT EXISTS by_file ON passages(file);
     """)
@@ -156,6 +170,10 @@ def inventory(db, cfg):
                         (fid, str(path)),
                     )
             dirs[:] = allowed
+    purge_missing(db, cfg)
+
+
+def purge_missing(db, cfg):
     for fid, raw in db.execute("SELECT id,path FROM files"):
         path = Path(raw)
         if not eligible(path, cfg) or not path.exists() or not os.access(path, os.R_OK):
@@ -220,7 +238,8 @@ def extract(path, expected):
 
 
 class Encoder:
-    def __init__(self):
+    def __init__(self, name=models.DEFAULT):
+        folder = models.folder(MODEL, name)
         import numpy as np
         import onnxruntime as ort
         from tokenizers import Tokenizer
@@ -230,9 +249,9 @@ class Encoder:
         opts.intra_op_num_threads = 2
         opts.inter_op_num_threads = 1
         self.session = ort.InferenceSession(
-            str(MODEL / "model.onnx"), opts, providers=["CPUExecutionProvider"]
+            str(folder / "model.onnx"), opts, providers=["CPUExecutionProvider"]
         )
-        self.tokens = Tokenizer.from_file(str(MODEL / "tokenizer.json"))
+        self.tokens = Tokenizer.from_file(str(folder / "tokenizer.json"))
         self.tokens.enable_truncation(max_length=512)
         self.lock = threading.Lock()
 
@@ -260,7 +279,14 @@ def enrich(db, cfg, encoder):
     for fid, raw, saved in jobs:
         path = Path(raw)
         try:
-            if not eligible(path, cfg) or stamp(path.stat()) != saved:
+            if not visible(path, saved, cfg):
+                with db:
+                    db.execute("BEGIN IMMEDIATE")
+                    if db.execute(
+                        "SELECT 1 FROM files WHERE id=? AND path=? AND stamp=?",
+                        (fid, raw, saved),
+                    ).fetchone():
+                        forget(db, fid)
                 continue
             body = extract(path, saved)
         except (
@@ -396,15 +422,14 @@ def visible(path, saved, cfg):
 
 
 def session_signature():
-    # Watch filesystem metadata only. Authentication remains inside the CLI.
-    folder = Path(os.getenv("XDG_CONFIG_HOME", HOME / ".config")) / "lycatra"
-    records = []
-    for file in sorted([folder / "auth.json", *folder.glob("profiles/*/auth.json")]):
-        try:
-            records.append(f"{file.name}/{stamp(file.stat())}")
-        except FileNotFoundError:
-            pass
-    return hashlib.sha256("|".join(records).encode()).hexdigest() if records else None
+    # The CLI refreshes its access token during normal queries. Bind consent
+    # to its production user identity, which survives token rotation.
+    path = Path(os.getenv("XDG_CONFIG_HOME", HOME / ".config")) / "lycatra/auth.json"
+    try:
+        account = json.loads(path.read_text()).get("user", {}).get("id")
+    except (FileNotFoundError, ValueError):
+        return None
+    return hashlib.sha256(str(account).encode()).hexdigest() if account else None
 
 
 def session_watch():
@@ -419,7 +444,8 @@ def session_watch():
 
 def wiki(q, cfg):
     if (
-        not cfg.get("wiki")
+        cfg.get("offline_only")
+        or not cfg.get("wiki")
         or not cfg.get("wiki_session")
         or cfg["wiki_session"] != session_signature()
         or not shutil.which("lycatra")
@@ -430,11 +456,13 @@ def wiki(q, cfg):
         ["lycatra", "wiki", "s", q, "--limit", "10", "--json"],
         capture_output=True,
         timeout=8,
+        env={**os.environ, "LYCATRA_CLI_CHANNEL": "stable"},
     )
     if (
         proc.returncode
         or cfg["wiki_session"] != session_signature()
         or not settings().get("wiki")
+        or settings().get("offline_only")
     ):
         return []
     result = json.loads(proc.stdout)
@@ -489,6 +517,10 @@ def search(stage, query):
     cfg = settings()
     if stage == "wiki":
         return wiki(q, cfg)
+    if not cfg.get("local", True) or (
+        stage == "semantic" and not cfg.get("semantic", True)
+    ):
+        return []
     if stage == "semantic":
         if not SOCKET.exists():
             return []
@@ -500,7 +532,7 @@ def search(stage, query):
                 return []
             client.sendall(json.dumps(q).encode() + b"\n")
             return json.loads(client.makefile("rb").readline(65536))
-    file = STATE / "search-v1.db"
+    file = database()
     if not file.exists():
         return []
     with contextlib.closing(
@@ -512,26 +544,36 @@ def search(stage, query):
 def serve():
     import socketserver
 
-    encoder = Encoder() if (MODEL / "model.onnx").exists() else None
+    active = settings().get("model", models.DEFAULT)
+    encoder = (
+        Encoder(active)
+        if (models.folder(MODEL, active) / "model.onnx").exists()
+        else None
+    )
 
     def maintain(content):
-        with contextlib.closing(connect()) as db:
+        with contextlib.closing(connect(active)) as db:
             while True:
                 delay = 60
                 try:
                     cfg = settings()
+                    if cfg.get("paused") or not cfg.get("local", True):
+                        time.sleep(3)
+                        continue
                     if content:
                         budget = cfg.get("index_mib", 2048) * 1024 * 1024
                         used = sum(
                             p.stat().st_size
-                            for p in STATE.glob("search-v1.db*")
+                            for p in STATE.glob(database(active).name + "*")
                             if p.exists()
                         )
                         if (
                             used < budget
                             and shutil.disk_usage(STATE).free > 512 * 1024 * 1024
                         ):
-                            count = enrich(db, cfg, encoder)
+                            count = enrich(
+                                db, cfg, encoder if cfg.get("semantic", True) else None
+                            )
                             delay = 1 if count else 5
                     else:
                         inventory(db, cfg)
@@ -546,22 +588,37 @@ def serve():
     class Handler(socketserver.StreamRequestHandler):
         def handle(self):
             self.request.settimeout(5)
-            q = json.loads(self.rfile.readline(4096))
-            with contextlib.closing(connect()) as db:
-                hits = (
-                    semantic(db, q, settings(), encoder)
-                    if encoder and isinstance(q, str) and 0 < len(q) <= 500
-                    else []
-                )
+            request = json.loads(self.rfile.readline(8192))
+            # Accept older clients during a release handover.
+            stage = request.get("stage") if isinstance(request, dict) else "semantic"
+            q = request.get("q") if isinstance(request, dict) else request
+            hits = []
+            if isinstance(q, str) and 0 < len(q) <= 500:
+                scope, q = routed(q)
+                with contextlib.closing(connect(active)) as db:
+                    cfg = settings()
+                    if scope != "wiki" and q and cfg.get("local", True):
+                        if stage == "lexical":
+                            hits = lexical(db, q, settings())
+                        elif (
+                            stage == "semantic"
+                            and encoder
+                            and cfg.get("semantic", True)
+                        ):
+                            hits = semantic(db, q, settings(), encoder)
             self.wfile.write(json.dumps(hits).encode() + b"\n")
 
-    with contextlib.closing(connect()) as db:
+    with contextlib.closing(connect(active)) as db:
         initialize(db)
     # A second manual service launch must not steal the live listening socket.
     lock = (STATE / "server.lock").open("a")
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     SOCKET.unlink(missing_ok=True)
-    with socketserver.UnixStreamServer(str(SOCKET), Handler) as server:
+
+    class Server(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+        daemon_threads = True
+
+    with Server(str(SOCKET), Handler) as server:
         for content in (False, True):
             threading.Thread(target=maintain, args=(content,), daemon=True).start()
         server.serve_forever()

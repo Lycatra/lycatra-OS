@@ -1,0 +1,10 @@
+[Unit]
+Description=Prepare Lycatra search model %i
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/lycatra-desktop model-prepare %i
+Nice=15
+IOSchedulingClass=idle
+UMask=0077
+NoNewPrivileges=yes
+MemoryMax=1536M

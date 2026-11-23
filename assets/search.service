@@ -1,8 +1,10 @@
 [Unit]
 Description=Lycatra private file search
 PartOf=graphical-session.target
+Wants=lycatra-menu-compat.path
 [Service]
 ExecStart=%h/.local/bin/lycatra-desktop serve
+ExecStartPost=-%h/.local/bin/lycatra-desktop menu-compat
 Restart=on-failure
 RestartSec=5
 UMask=0077

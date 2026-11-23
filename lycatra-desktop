@@ -1,4 +1,25 @@
 #!/usr/bin/env python3
+# Launcher keystrokes use the warm daemon without importing setup and packaging.
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+if (
+    __name__ == "__main__"
+    and len(sys.argv) in (4, 5)
+    and sys.argv[1] == "query"
+    and sys.argv[2] in ("lexical", "semantic")
+    and (len(sys.argv) == 4 or sys.argv[3] == "--")
+):
+    import json
+    from client import local_query
+
+    try:
+        print(json.dumps(local_query(sys.argv[2], sys.argv[-1])))
+        raise SystemExit(0)
+    except (OSError, ValueError):
+        pass  # The regular CLI can still read filenames while the service restarts.
+
 import argparse
 import contextlib
 import hashlib
@@ -8,16 +29,20 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import urllib.request
-import venv
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
 import manage
+import menu
+import models
+import preferences
 import search
 
 
-def setup_model():
+def setup_model(name=models.DEFAULT):
+    import urllib.request
+    import venv
+
     base = search.MODEL
     base.mkdir(mode=0o700, parents=True, exist_ok=True)
     runtime = base / "venv"
@@ -35,27 +60,23 @@ def setup_model():
         ],
         check=True,
     )
-    rev = "614241f622f53c4eeff9890bdc4f31cfecc418b3"
-    for name, digest in [
-        (
-            "onnx/model.onnx",
-            "ca456c06b3a9505ddfd9131408916dd79290368331e7d76bb621f1cba6bc8665",
-        ),
-        (
-            "tokenizer.json",
-            "0b44a9d7b51c3c62626640cda0e2c2f70fdacdc25bbbd68038369d14ebdf4c39",
-        ),
+    spec = models.MODELS[name]
+    dest = models.folder(base, name)
+    dest.mkdir(mode=0o700, exist_ok=True)
+    for remote, filename, digest in [
+        (spec["onnx"], "model.onnx", spec["model_hash"]),
+        ("tokenizer.json", "tokenizer.json", spec["vocabulary_sha256"]),
     ]:
-        target = base / Path(name).name
+        target = dest / filename
         if target.exists():
             with target.open("rb") as f:
                 if hashlib.file_digest(f, "sha256").hexdigest() == digest:
                     continue
-        with tempfile.NamedTemporaryFile(dir=base, delete=False) as f:
+        with tempfile.NamedTemporaryFile(dir=dest, delete=False) as f:
             tmp = Path(f.name)
             try:
                 with urllib.request.urlopen(
-                    f"https://huggingface.co/intfloat/multilingual-e5-small/resolve/{rev}/{name}",
+                    f"https://huggingface.co/{spec['repo']}/resolve/{spec['revision']}/{remote}",
                     timeout=60,
                 ) as stream:
                     shutil.copyfileobj(stream, f)
@@ -81,6 +102,8 @@ def main():
             help="Materialize files without activating desktop services",
         )
         cmd.add_argument("--json", action="store_true")
+        if op == "update":
+            cmd.add_argument("--channel", choices=["stable", "preview"])
         if op in ("apply", "update"):
             cmd.add_argument(
                 "--install-deps",
@@ -88,8 +111,13 @@ def main():
                 help="Install missing system packages through Omarchy",
             )
     sub.add_parser("catalog")
-    sub.add_parser("model-install")
+    for op in ["model-install", "model-index", "model-prepare"]:
+        sub.add_parser(op).add_argument(
+            "model", nargs="?", default=models.DEFAULT, choices=models.MODELS
+        )
+    sub.add_parser("settings")
     sub.add_parser("serve")
+    sub.add_parser("menu-compat")
     sub.add_parser("session-watch")
     sub.add_parser("status")
     for op in ("pause", "resume", "reindex", "webapp"):
@@ -99,15 +127,48 @@ def main():
     q.add_argument("phrase")
     sub.add_parser("open").add_argument("result", nargs=2)
     conf = sub.add_parser("configure")
-    conf.add_argument("--wiki", choices=["on", "off"])
+    for key in preferences.SWITCHES:
+        conf.add_argument("--" + key.replace("_", "-"), dest=key, choices=["on", "off"])
     conf.add_argument("--root", action="append")
     conf.add_argument("--exclude", action="append")
     a = p.parse_args()
+    if a.op == "menu-compat":
+        if (
+            not menu.SOURCE.is_dir()
+            or hashlib.sha256((menu.SOURCE / "Menu.qml").read_bytes()).hexdigest()
+            != menu.SUPPORTED
+        ):
+            if manage.plugin_state().get("lycatra.menu"):
+                manage.run("omarchy", "plugin", "disable", "lycatra.menu")
+            return {"menu": "stock", "reason": "installed Omarchy menu changed"}
+        return {"menu": "compatible"}
+    if a.op == "update":
+        receipt = manage.read(manage.RECEIPT, {})
+        selected = manage.names(set(receipt.get("selected", [])) | set(a.components))
+        if not selected:
+            raise ValueError("Select a component before updating.")
+        channel = a.channel or (
+            "preview" if "-preview." in receipt.get("tag", "") else "stable"
+        )
+        args = [str(manage.ROOT / "release/bootstrap.sh"), *selected]
+        if a.stage:
+            args.append("--stage")
+        if a.install_deps:
+            args.append("--install-deps")
+        env = {**os.environ, "LYCATRA_DESKTOP_CHANNEL": channel}
+        env.pop("LYCATRA_DESKTOP_RELEASE", None)
+        os.execve(args[0], args, env)
     if a.op == "catalog":
         return manage.CAT
     if a.op == "model-install":
-        setup_model()
-        return {"model": "multilingual-e5-small"}
+        setup_model(a.model)
+        return {"model": a.model}
+    if a.op == "settings":
+        return preferences.show()
+    if a.op == "model-prepare":
+        return preferences.prepare(a.model)
+    if a.op == "model-index":
+        return preferences.build_index(a.model)
     if a.op == "query":
         return search.search(a.stage, a.phrase)
     if a.op == "open":
@@ -127,27 +188,18 @@ def main():
             os.execv(py, [str(py), str(Path(__file__).resolve()), "serve"])
         return search.serve()
     if a.op == "configure":
-        cfg = search.settings()
-        for key, values in [("roots", a.root), ("exclude", a.exclude)]:
-            if values is not None:
-                cfg[key] = [str(Path(v).expanduser().resolve()) for v in values]
-        if a.wiki:
-            cfg["wiki"] = a.wiki == "on"
-            cfg["wiki_session"] = search.session_signature() if cfg["wiki"] else None
-            if cfg["wiki"] and (not cfg["wiki_session"] or not shutil.which("lycatra")):
-                raise ValueError(
-                    "Sign in with lycatra login before enabling wiki search."
-                )
-        manage.save(search.CONFIG, cfg)
-        return cfg
+        values = {}
+        for key, paths in [("roots", a.root), ("exclude", a.exclude)]:
+            if paths is not None:
+                values[key] = [str(Path(v).expanduser().resolve()) for v in paths]
+        for key in preferences.SWITCHES:
+            value = getattr(a, key)
+            if value is not None:
+                values[key] = value == "on"
+        cfg = preferences.update(values)
+        return {k: v for k, v in cfg.items() if k != "wiki_session"}
     if a.op in ("pause", "resume"):
-        manage.run(
-            "systemctl",
-            "--user",
-            "stop" if a.op == "pause" else "start",
-            "lycatra-search.service",
-        )
-        return {"paused": a.op == "pause"}
+        return {"paused": preferences.update({"paused": a.op == "pause"})["paused"]}
     if a.op in ("status", "reindex"):
         with contextlib.closing(search.connect()) as db:
             search.initialize(db)
@@ -161,19 +213,35 @@ def main():
                     "SELECT count(*) FROM files WHERE done=0"
                 ).fetchone()[0],
                 passages=db.execute("SELECT count(*) FROM passages").fetchone()[0],
-                model=(search.MODEL / "model.onnx").exists(),
+                model=(
+                    models.folder(
+                        search.MODEL, search.settings().get("model", models.DEFAULT)
+                    )
+                    / "model.onnx"
+                ).exists(),
+                embedding_model=search.settings().get("model", models.DEFAULT),
                 wiki=search.settings().get("wiki", False),
             )
-    if a.op == "apply" and not a.components and not manage.RECEIPT.exists():
-        if not sys.stdin.isatty():
-            raise ValueError("Choose components explicitly, or select studio")
-        for k, v in manage.CAT.items():
-            print(f"{k:12} {v['description']}", file=sys.stderr)
+    interactive_setup = a.op == "apply" and not a.components and sys.stdin.isatty()
+    if interactive_setup:
+        for key, component in manage.CAT.items():
+            print(f"{key:12} {component['description']}", file=sys.stderr)
         a.components = input(
             "Choose components (space-separated), or studio for all: "
         ).split()
         if not a.components:
             raise ValueError("No components selected")
+        plan = manage.manage("plan", a.components, True)
+        print("Selected: " + ", ".join(plan["selected"]), file=sys.stderr)
+        print("Files to change: " + str(len(plan["changes"])), file=sys.stderr)
+        if plan["conflicts"]:
+            raise ValueError(
+                "Resolve conflicting paths: " + ", ".join(plan["conflicts"])
+            )
+        if input("Apply to this account? [y/N] ").strip().lower() != "y":
+            return {"cancelled": True}
+    elif a.op == "apply" and not a.components and not manage.RECEIPT.exists():
+        raise ValueError("Choose components explicitly, or select studio")
     if a.op in ("apply", "update") and not a.stage:
         plan = manage.manage("plan", a.components, True)
         if plan["missing_commands"] and not plan["conflicts"]:
@@ -211,7 +279,43 @@ def main():
             and not (search.MODEL / "tokenizer.json").exists()
         ):
             setup_model()
+    if (
+        a.op == "apply"
+        and not a.stage
+        and "search" in plan["selected"]
+        and not search.CONFIG.exists()
+    ):
+        preferences.update({})
     result = manage.manage(a.op, a.components, a.stage)
+    if (
+        interactive_setup
+        and not a.stage
+        and "search" in result["selected"]
+        and not search.settings().get("wiki")
+    ):
+        if not shutil.which("lycatra"):
+            print(
+                "For online wiki search, install the Lycatra CLI from https://lycatra.com/install.sh and run lycatra login.",
+                file=sys.stderr,
+            )
+        elif not search.session_signature():
+            print(
+                "Sign in with lycatra login, then run lycatra-desktop configure --wiki on.",
+                file=sys.stderr,
+            )
+        elif (
+            input(
+                "Include wiki results? This sends typed search phrases to Lycatra. [y/N] "
+            )
+            .strip()
+            .lower()
+            == "y"
+        ):
+            cfg = search.settings()
+            manage.save(
+                search.CONFIG,
+                {**cfg, "wiki": True, "wiki_session": search.session_signature()},
+            )
     if a.op == "verify" and (
         result.get("inactive")
         or result["changes"]

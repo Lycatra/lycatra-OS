@@ -105,9 +105,19 @@ def files(selected, owned=None):
             "[Desktop Entry]\nType=Application\nName=Lycatra\nExec=lycatra-desktop webapp\nIcon=web-browser\nCategories=Office;\n",
         )
     if "search" in selected:
+        put(
+            ".local/share/applications/lycatra-search-settings.desktop",
+            "[Desktop Entry]\nType=Application\nName=Search settings\nComment=Omarchy and Lycatra search preferences\nExec=lycatra-desktop settings\nIcon=preferences-system-search\nCategories=Settings;\n",
+        )
+        copy(ASSETS / "model.service", ".config/systemd/user/lycatra-model@.service")
         for name, data in menu.render().items():
             put(plugins + "lycatra.menu/" + name, data)
         copy(ASSETS / "search.service", ".config/systemd/user/lycatra-search.service")
+        for ext in ("service", "path"):
+            copy(
+                ASSETS / ("compat." + ext),
+                ".config/systemd/user/lycatra-menu-compat." + ext,
+            )
     for key in ("phone", "media", "keyboard", "updates"):
         plugin = CAT[key]["plugin"]
         if key in selected and not existing_plugin(plugin, plugin):
@@ -173,6 +183,14 @@ def dst(rel):
 
 def inspect(selected):
     receipt = read(RECEIPT, {"selected": [], "owned": {}})
+    if os.environ.get("LYCATRA_DESKTOP_INSTALLING") and "manager" not in receipt:
+        existing = HOME / ".local/bin/lycatra-desktop"
+        if (
+            existing.is_symlink()
+            and existing.resolve().parent.parent
+            == HOME / ".local/share/lycatra-desktop/releases"
+        ):
+            receipt["manager"] = str(existing.resolve())
     target = files(selected, receipt["owned"])
     changes = {}
     conflicts = []
@@ -230,7 +248,19 @@ def inspect(selected):
     missing = sorted(
         {c for k in selected for c in CAT[k].get("commands", []) if not shutil.which(c)}
     )
-    return receipt, {"selected": selected, "owned": owned}, changes, conflicts, missing
+    new = {**receipt, "selected": selected, "owned": owned}
+    install = os.environ.get("LYCATRA_DESKTOP_INSTALLING")
+    if install:
+        # Only an executable inside the manager's release store can claim a release.
+        executable = Path(install).resolve()
+        if (
+            executable == ROOT / "lycatra-desktop"
+            and executable.parent.parent
+            == HOME / ".local/share/lycatra-desktop/releases"
+        ):
+            new["manager"] = str(executable)
+            new["tag"] = os.environ.get("LYCATRA_DESKTOP_RELEASE", "")
+    return receipt, new, changes, conflicts, missing
 
 
 def write(rel, value):
@@ -248,6 +278,22 @@ def commit(tx):
             raise ValueError(f"Edited during transaction: {rel}")
         if actual != after:
             write(rel, after)
+    manager = tx["new"].get("manager")
+    if manager:
+        target = Path(manager)
+        if (
+            not target.is_file()
+            or target.name != "lycatra-desktop"
+            or target.parent.parent != HOME / ".local/share/lycatra-desktop/releases"
+        ):
+            raise ValueError("Previous release executable unavailable")
+        link = HOME / ".local/bin/lycatra-desktop"
+        if link.exists() and not link.is_symlink():
+            raise ValueError("Existing manager is not owned by the installer")
+        pending = link.with_suffix(".lycatra-new")
+        pending.unlink(missing_ok=True)
+        pending.symlink_to(target)
+        os.replace(pending, link)
     save(RECEIPT, tx["new"])
     save(UNDO, tx)
     PENDING.unlink(missing_ok=True)
@@ -341,6 +387,10 @@ def manage(op, items, stage):
             commit(tx)
         if not stage:
             activate(tx["new"]["selected"])
+            if "search" in tx["new"]["selected"] and tx["old"].get("manager") != tx[
+                "new"
+            ].get("manager"):
+                run("systemctl", "--user", "restart", "lycatra-search.service")
             save(STATE / "active.json", tx["new"]["selected"])
             baseline = read(STATE / "baseline.json", {})
             save(
