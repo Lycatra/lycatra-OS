@@ -1,0 +1,44 @@
+#!/usr/bin/bash
+# Run this from the recorder's press and release bindings.
+set -euo pipefail
+umask 077
+
+if [[ ${1:-} != start && ${1:-} != stop ]]; then
+    echo "Usage: dictation-focus start [microphone selector] | stop" >&2
+    exit 2
+fi
+
+lease=omarchy-dictation-focus.service
+watch=omarchy-dictation-focus-watch.service
+exec 9>"${XDG_RUNTIME_DIR:?}/dictation-focus.lock"
+flock -w 8 9
+
+if [[ $1 == stop ]]; then
+    trap 'systemctl --user stop "$lease"' EXIT
+    if systemctl --user is-active --quiet superwhisper.service; then
+        superwhisper stop
+    fi
+    exit
+fi
+
+if systemctl --user is-active --quiet "$lease"; then
+    exit
+fi
+
+# Users can still dictate if media focus is unavailable or deliberately disabled.
+if systemctl --user is-active --quiet omarchy-media-focus.service; then
+    systemctl --user start "$lease" || echo "Media focus lease unavailable" >&2
+fi
+if [[ $# == 2 ]] && device=$("$2" probe) && [[ -n $device ]]; then
+    if ! superwhisper start --device "$device"; then
+        systemctl --user stop "$lease"
+        exit 1
+    fi
+elif ! superwhisper start; then
+    systemctl --user stop "$lease"
+    exit 1
+fi
+
+if systemctl --user is-active --quiet "$lease"; then
+    systemctl --user start "$watch" || systemctl --user stop "$lease"
+fi

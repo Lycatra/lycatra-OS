@@ -1,0 +1,17 @@
+[Unit]
+Description=Lycatra private file search
+PartOf=graphical-session.target
+[Service]
+ExecStart=%h/.local/bin/lycatra-desktop serve
+Restart=on-failure
+RestartSec=5
+UMask=0077
+Nice=10
+IOSchedulingClass=idle
+NoNewPrivileges=yes
+RestrictAddressFamilies=AF_UNIX
+LockPersonality=yes
+MemoryHigh=1G
+MemoryMax=1536M
+[Install]
+WantedBy=graphical-session.target

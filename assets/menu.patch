@@ -1,0 +1,100 @@
+--- Menu.qml
++++ Menu.qml
+@@ -747,6 +747,27 @@
+         for (var d = 0; d < drilldownRows.length; d++) drilldownRows[d].section = "drilldown"
+       }
+       rows = currentRows.concat(drilldownRows)
++      if (root.desktopQuery) {
++        var seen = new Map()
++        for (var stage of ["lexical","wiki","semantic"]) {
++          var hits = root.desktopHits[stage] || []
++          for (var n=0; n<hits.length; n++) {
++            var hit=hits[n], id=hit.kind+"|"+hit.target
++            var entry=seen.get(id)
++            if (!entry) {
++              entry={itemId:id, kind:"desktop", target:hit.target, provider:hit.kind, label:hit.label,
++                detail:hit.detail, disabled:false, icon:hit.kind==="wiki" ? "󰖬" : "󰈔", iconFont:"",
++                appId:"",appIcon:"",childCount:0,path:"",action:"",section:"",score:0}
++              seen.set(id,entry)
++            }
++            entry.score += (hit.exact ? 10 : 0) + 1/(12+n)
++          }
++        }
++        var direct = r => r.label.toLowerCase().startsWith(query.toLowerCase())
++        var exact=rows.filter(direct)
++        rows=exact.concat(Array.from(seen.values()).sort((a,b)=>b.score-a.score),
++          rows.filter(r => !direct(r)))
++      }
+     } else {
+       for (var j = 0; j < root.itemOrder.length; j++) {
+         var child = root.item(root.itemOrder[j])
+@@ -816,6 +837,56 @@
+     selectedIndex = target
+     revealCursor()
+   }
++
++
++  property string desktopQuery: opened && activeMenu === "root" && !dmenuActive ? filterText.trim() : ""
++  property var desktopHits: ({})
++  readonly property string desktopTool: Quickshell.env("HOME") + "/.local/bin/lycatra-desktop"
++  onDesktopQueryChanged: {
++    desktopHits = ({})
++    fastSearch.restart()
++    deepSearch.restart()
++  }
++  Process {
++    running: root.opened && root.activeMenu === "root" && !root.dmenuActive
++    command: [root.desktopTool, "session-watch"]
++    stdout: SplitParser {
++      onRead: {
++        pages.running = false
++        root.desktopHits.wiki = []
++        root.rebuildDisplay()
++      }
++    }
++  }
++  Timer { id: fastSearch; interval: 30; onTriggered: names.start() }
++  Timer { id: deepSearch; interval: 220; onTriggered: { meanings.start(); pages.start() } }
++  component SearchWorker: Process {
++    id: worker
++    required property string stage
++    property string requested
++    function start() {
++      if (!root.desktopQuery || running) return
++      requested = root.desktopQuery
++      command = [root.desktopTool, "query", stage, "--", requested]
++      running = true
++    }
++    stdout: StdioCollector {
++      onStreamFinished: {
++        if (worker.requested !== root.desktopQuery) return
++        try {
++          root.desktopHits[worker.stage] = JSON.parse(text)
++          var old = displayModel.count && root.selectedIndex < displayModel.count ? displayModel.get(root.selectedIndex).itemId : ""
++          root.rebuildDisplay()
++          for (var i=0; old && i<displayModel.count; i++)
++            if (displayModel.get(i).itemId === old) { root.selectedIndex=i; break }
++        } catch (e) {}
++      }
++    }
++    onExited: if (requested !== root.desktopQuery && root.desktopQuery) Qt.callLater(start)
++  }
++  SearchWorker { id: names; stage: "lexical" }
++  SearchWorker { id: meanings; stage: "semantic" }
++  SearchWorker { id: pages; stage: "wiki" }
+ 
+   function setFilter(nextFilter) {
+     panel.freezeCardTop()
+@@ -888,7 +959,11 @@
+     if (!root.rowSelectable(index)) return
+ 
+     var row = displayModel.get(index)
+-    if (row.kind === "menu" || row.kind === "link") {
++    if (row.kind === "desktop") {
++      var args = [root.desktopTool, "open", row.provider, row.target]
++      root.cancel()
++      Quickshell.execDetached(args)
++    } else if (row.kind === "menu" || row.kind === "link") {
+       root.setActiveMenu(row.target || row.itemId, true, fromPointer)
+     } else if (row.kind === "app") {
+       var appId = row.appId

@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "id": "local.media-controls",
+  "name": "Media controls",
+  "version": "1.0.0",
+  "author": "Local",
+  "description": "Playback and volume for desktop players and connected Bluetooth phones",
+  "kinds": ["bar-widget"],
+  "entryPoints": {"barWidget":"Panel.qml"},
+  "barWidget": {"displayName":"Media controls","description":"Desktop and Bluetooth playback mixer","category":"Media","allowMultiple":false}
+}

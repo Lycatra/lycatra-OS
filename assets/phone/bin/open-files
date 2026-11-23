@@ -1,0 +1,44 @@
+#!/usr/bin/python
+import json
+import os
+import subprocess
+import sys
+import time
+
+
+def hypr_json(command):
+    return json.loads(subprocess.check_output(["hyprctl", "-j", command]))
+
+
+def main():
+    monitor_name, target = sys.argv[1:]
+    monitors = hypr_json("monitors")
+    monitor = next((item for item in monitors if item["name"] == monitor_name), None)
+    if not monitor:
+        monitor = next(item for item in monitors if item["focused"])
+    workspace = json.dumps(str(monitor["activeWorkspace"]["id"]))
+    old = {item["address"] for item in hypr_json("clients")}
+    subprocess.Popen(["nautilus", "--new-window", os.path.abspath(target)])
+    for _ in range(45):
+        windows = [item for item in hypr_json("clients")
+                   if item["class"] == "org.gnome.Nautilus" and item["address"] not in old]
+        if len(windows) > 1:
+            return
+        if windows:
+            selector = json.dumps("address:" + windows[0]["address"])
+            width = min(950, int(monitor["width"] / monitor["scale"] * 0.76))
+            height = min(680, int(monitor["height"] / monitor["scale"] * 0.76))
+            for action in (
+                f'hl.dsp.window.float({{action = "on", window = {selector}}})',
+                f"hl.dsp.window.move({{workspace = {workspace}, follow = false, window = {selector}}})",
+                f"hl.dsp.window.resize({{x = {width}, y = {height}, relative = false, window = {selector}}})",
+                f"hl.dsp.window.center({{window = {selector}}})",
+                f"hl.dsp.focus({{window = {selector}}})",
+            ):
+                subprocess.run(["hyprctl", "dispatch", action], check=True)
+            return
+        time.sleep(0.1)
+
+
+if __name__ == "__main__":
+    main()

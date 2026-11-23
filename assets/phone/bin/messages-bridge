@@ -1,0 +1,163 @@
+#!/usr/bin/python
+"""Expose KDE Connect conversation data to the panel over private stdio."""
+import json
+import os
+import re
+import sys
+
+from gi.repository import Gio, GLib
+from phone_cache import PhoneCache
+
+SERVICE = "org.kde.kdeconnect"
+INTERFACE = SERVICE + ".device.conversations"
+
+
+def emit(event, **data):
+    print(json.dumps({"event": event, **data}), flush=True)
+
+
+def message(raw):
+    _, body, addresses, date, kind, read, thread, uid, _, attachments = raw
+    return {
+        "id": str(uid),
+        "thread": str(thread),
+        "label": ", ".join(address[:128] for (address,) in addresses[:12]) or "Unknown sender",
+        "addresses": [address[:128] for (address,) in addresses[:12]],
+        "text": body[:16000],
+        "date": date,
+        "outgoing": kind in (2, 3, 4, 5, 6),
+        "unread": kind == 1 and not read,
+        "attachments": len(attachments),
+    }
+
+
+class Bridge:
+    def __init__(self, device, warming=False):
+        if not re.fullmatch(r"[A-Za-z0-9_]{1,80}", device):
+            raise ValueError("Invalid device ID")
+        self.cache = PhoneCache(device)
+        self.warming = warming
+        self.bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        self.path = "/modules/kdeconnect/devices/" + device
+        self.buffer = b""
+        self.loop = GLib.MainLoop()
+        self.bus.signal_subscribe(
+            SERVICE, INTERFACE, None, self.path, None,
+            Gio.DBusSignalFlags.NONE, self.on_signal,
+        )
+
+    def call(self, name, signature=None, values=()):
+        args = GLib.Variant(signature, values) if signature else None
+        return self.bus.call_sync(
+            SERVICE, self.path, INTERFACE, name, args, None,
+            Gio.DBusCallFlags.NONE, 4000, None,
+        ).unpack()
+
+    def on_signal(self, _bus, _sender, _path, _interface, name, args):
+        data = args.unpack()
+        if name in ("conversationCreated", "conversationUpdated"):
+            item = message(data[0])
+            self.cache.save_messages([item])
+            if not self.warming:
+                emit("message", message=item)
+        elif name == "conversationRemoved":
+            self.cache.remove_thread(str(data[0]))
+            if not self.warming:
+                emit("removed", thread=str(data[0]))
+        elif name == "conversationLoaded" and not self.warming:
+            emit("loaded", thread=str(data[0]), count=data[1])
+
+    def refresh(self):
+        if not self.warming:
+            phonebook = self.cache.phonebook()
+            emit("contacts", contacts=[
+                {"name": contact["name"], "numbers": [entry["number"] for entry in contact["numbers"]]}
+                for contact in (phonebook or {}).get("contacts", [])
+            ])
+            cached = self.cache.threads()
+            if cached:
+                emit("threads", threads=cached)
+        (threads,) = self.call("activeConversations")
+        threads = sorted(threads, key=lambda item: item[3], reverse=True)
+        self.cache.save_messages([message(item) for item in threads[:2000]])
+        if not self.warming:
+            emit("threads", threads=self.cache.threads())
+        self.call("requestAllConversationThreads")
+
+    def warm(self):
+        self.refresh()
+        queue = iter(self.cache.threads_to_warm())
+
+        def next_thread():
+            thread = next(queue, None)
+            if thread is None:
+                GLib.timeout_add_seconds(5, stop)
+                return False
+            try:
+                self.call("requestConversation", "(xii)", (int(thread), 0, 35))
+            except GLib.Error:
+                self.loop.quit()
+                return False
+            return True
+
+        def stop():
+            self.loop.quit()
+            return False
+
+        GLib.timeout_add(1250, next_thread)
+        self.loop.run()
+
+    def on_command(self, request):
+        action = request["action"]
+        if action == "refresh":
+            self.refresh()
+        elif action == "history":
+            start = int(request.get("start", 0))
+            thread = str(int(request["thread"]))
+            emit("historyCache", thread=thread, messages=self.cache.history(thread, start))
+            self.call("requestConversation", "(xii)", (int(thread), start, start + 35))
+        elif action in ("reply", "compose"):
+            body = request["text"]
+            if not isinstance(body, str) or not body.strip() or len(body) > 4000:
+                raise ValueError("Enter a message of up to 4,000 characters.")
+            if action == "reply":
+                self.call("replyToConversation", "(xsav)", (int(request["thread"]), body, []))
+            else:
+                number = request["number"].strip()
+                if not re.fullmatch(r"\+?[0-9][0-9 .()-]{1,30}", number):
+                    raise ValueError("Enter a phone number.")
+                self.call("sendWithoutConversation", "(avsav)", ([GLib.Variant("(s)", (number,))], body, []))
+            emit("submitted")
+
+    def on_stdin(self, fd, condition):
+        if condition & GLib.IO_IN:
+            self.buffer += os.read(fd, 65536)
+            while b"\n" in self.buffer:
+                line, self.buffer = self.buffer.split(b"\n", 1)
+                action = ""
+                try:
+                    request = json.loads(line)
+                    action = request.get("action", "")
+                    self.on_command(request)
+                except GLib.Error:
+                    emit("error", action=action, text="The Pixel did not respond. Check its connection and try again.")
+                except (KeyError, TypeError, ValueError) as exc:
+                    emit("error", action=action, text=str(exc))
+        if condition & (GLib.IO_HUP | GLib.IO_ERR) or len(self.buffer) > 65536:
+            self.loop.quit()
+            return False
+        return True
+
+    def run(self):
+        GLib.io_add_watch(sys.stdin.fileno(), GLib.PRIORITY_DEFAULT,
+                          GLib.IO_IN | GLib.IO_HUP | GLib.IO_ERR, self.on_stdin)
+        emit("ready")
+        self.loop.run()
+
+
+if __name__ == "__main__":
+    worker = Bridge(sys.argv[1], warming="--warm" in sys.argv[2:])
+    if worker.warming:
+        worker.warm()
+    else:
+        worker.run()

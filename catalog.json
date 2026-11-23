@@ -1,0 +1,87 @@
+{
+  "version": "0.1.0",
+  "components": {
+    "webapp": {
+      "description": "Lycatra app window",
+      "requires": []
+    },
+    "search": {
+      "description": "Super+Space local and wiki search",
+      "requires": [
+        "webapp"
+      ],
+      "plugin": "lycatra.menu",
+      "service": "lycatra-search.service",
+      "commands": [
+        "pdftotext"
+      ]
+    },
+    "phone": {
+      "description": "KDE Connect phone panel and paired-device actions",
+      "requires": [],
+      "plugin": "seb-krz.omarchy-connect",
+      "commands": [
+        "kdeconnect-cli",
+        "adb",
+        "scrcpy"
+      ]
+    },
+    "media": {
+      "description": "Media controls and audio focus",
+      "requires": [],
+      "plugin": "local.media-controls",
+      "service": "omarchy-media-focus.service",
+      "commands": [
+        "pactl",
+        "parec"
+      ]
+    },
+    "dictation": {
+      "description": "Superwhisper panel and playback coordination",
+      "requires": [
+        "media"
+      ],
+      "plugin": "superwhisper.panel",
+      "commands": [
+        "superwhisper"
+      ]
+    },
+    "style": {
+      "description": "Square desktop windows and shell controls",
+      "requires": []
+    },
+    "developer": {
+      "description": "Studio development tools and agent launchers",
+      "requires": [],
+      "commands": [
+        "zeditor",
+        "codex"
+      ]
+    },
+    "keyboard": {
+      "description": "Show keyboard-layout changes in a native Omarchy popup",
+      "requires": [],
+      "plugin": "local.keyboard-layout-popup"
+    },
+    "updates": {
+      "description": "Notify when Arch package updates are available",
+      "requires": [],
+      "plugin": "op.system-update",
+      "commands": [
+        "checkupdates"
+      ]
+    }
+  },
+  "packages": {
+    "kdeconnect-cli": "kdeconnect",
+    "adb": "android-tools",
+    "scrcpy": "scrcpy",
+    "pactl": "libpulse",
+    "parec": "libpulse",
+    "superwhisper": "superwhisper-bin",
+    "zeditor": "zed",
+    "codex": "openai-codex-bin",
+    "pdftotext": "poppler",
+    "checkupdates": "pacman-contrib"
+  }
+}

@@ -1,0 +1,12 @@
+#!/usr/bin/bash
+# Release the lease if the recorder stops, is cancelled elsewhere, or exits.
+set -euo pipefail
+trap 'systemctl --user --no-block stop omarchy-dictation-focus.service' EXIT
+
+while IFS= read -r status; do
+    phase=$(jq -r '.alt // empty' <<< "$status")
+    case $phase in
+        recording|starting|preparing) ;;
+        *) break ;;
+    esac
+done < <(superwhisper status --bar --follow)

@@ -1,0 +1,14 @@
+[Unit]
+Description=Coordinate desktop and Bluetooth media playback
+PartOf=graphical-session.target
+After=pipewire-pulse.service
+
+[Service]
+Type=dbus
+BusName=org.omarchy.MediaFocus1
+ExecStart=%h/.local/bin/omarchy-media-focus
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target

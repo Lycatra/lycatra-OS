@@ -1,0 +1,368 @@
+#!/usr/bin/python
+"""Control a Pixel call and route its native PipeWire hands-free streams."""
+import json
+import os
+import re
+import select
+import signal
+import subprocess
+import sys
+import time
+
+from gi.repository import Gio, GLib
+
+from phone_call_state import snapshot
+
+PIXEL = os.environ.get("LYCATRA_PHONE_ADB", "")
+BT = os.environ.get("LYCATRA_PHONE_BLUETOOTH", "")
+MOTU_IN = re.compile(r"^alsa_input\.usb-MOTU_M4_.*__Mic1__source$")
+MOTU_OUT = re.compile(r"^alsa_output\.usb-MOTU_M4_.*__Line1__sink$")
+
+
+def run(*args):
+    return subprocess.check_output(args, text=True, timeout=5, stderr=subprocess.STDOUT)
+
+
+def adb(*args):
+    return run("adb", "-s", PIXEL, "shell", *args)
+
+
+def phone_state():
+    return snapshot().get("state", "")
+
+
+TELEPHONY = "org.pipewire.Telephony"
+GATEWAY = TELEPHONY + ".AudioGateway1"
+CALL = TELEPHONY + ".Call1"
+
+
+def telephony(bus, path, interface, method):
+    return bus.call_sync(TELEPHONY, path, interface, method, None, None,
+                         Gio.DBusCallFlags.NO_AUTO_START, 1000, None).unpack()
+
+
+def bluetooth_calls():
+    bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    objects, = telephony(bus, "/org/pipewire/Telephony",
+                         "org.freedesktop.DBus.ObjectManager", "GetManagedObjects")
+    for path, interfaces in objects.items():
+        if interfaces.get(GATEWAY, {}).get("Address", "").upper() == BT:
+            calls, = telephony(bus, path, "org.ofono.VoiceCallManager", "GetCalls")
+            return bus, [key for key, props in calls.items()
+                         if props.get("State") != "disconnected"]
+    return bus, []
+
+
+def can_bluetooth_hangup():
+    try:
+        _, calls = bluetooth_calls()
+        return len(calls) == 1
+    except GLib.Error:
+        return False
+
+
+def bluetooth_hangup():
+    try:
+        bus, calls = bluetooth_calls()
+    except GLib.Error:
+        return False
+    if len(calls) > 1:
+        raise ValueError("More than one Bluetooth call is active. End the intended call on the Pixel.")
+    if not calls:
+        return False
+    telephony(bus, calls[0], CALL, "Hangup")
+    return True
+
+
+def graph():
+    return json.loads(run("pw-dump"))
+
+
+def props(item):
+    return item.get("info", {}).get("props") or {}
+
+
+def devices(snapshot):
+    nodes = [item for item in snapshot if item["type"].endswith(":Node")]
+    mic = next((item for item in nodes if MOTU_IN.fullmatch(props(item).get("node.name", ""))), None)
+    speaker = next((item for item in nodes if MOTU_OUT.fullmatch(props(item).get("node.name", ""))), None)
+    hfp = [item for item in nodes if props(item).get("api.bluez5.address") == BT
+           and props(item).get("api.bluez5.profile") == "headset-audio-gateway"]
+    down = next((item for item in hfp if props(item).get("media.class") == "Stream/Output/Audio"), None)
+    up = next((item for item in hfp if props(item).get("media.class") == "Stream/Input/Audio"), None)
+    return mic, speaker, down, up
+
+
+def ports(snapshot, node, direction):
+    return [item["id"] for item in snapshot if item["type"].endswith(":Port")
+            and props(item).get("node.id") == node["id"] and props(item).get("port.direction") == direction]
+
+
+def audio_links(snapshot, mic, speaker, down, up):
+    mic_ports = ports(snapshot, mic, "out")
+    speaker_ports = ports(snapshot, speaker, "in")
+    down_ports = ports(snapshot, down, "out")
+    up_ports = ports(snapshot, up, "in")
+    if not all((mic_ports, speaker_ports, down_ports, up_ports)):
+        return set(), set()
+    wanted = {(down_ports[0], port) for port in speaker_ports}
+    wanted.add((mic_ports[0], up_ports[0]))
+    return wanted, set(down_ports + up_ports)
+
+
+def computer_audio_links(snapshot, speaker, bus, up):
+    speaker_inputs = set(ports(snapshot, speaker, "in"))
+    bus_inputs = ports(snapshot, bus, "in")
+    monitor_outputs = ports(snapshot, bus, "out")
+    uplink_inputs = ports(snapshot, up, "in")
+    if not all((bus_inputs, monitor_outputs, uplink_inputs)):
+        return set()
+
+    # Tap application playback before the physical speaker mixes it with the
+    # caller. The physical sink monitor and echo-cancel playback would both
+    # contain the caller's voice, so neither is a valid sharing source.
+    eligible = {
+        item["id"] for item in snapshot if item["type"].endswith(":Node")
+        and props(item).get("media.class") == "Stream/Output/Audio"
+        and not props(item).get("node.name", "").startswith(
+            ("echo-cancel", "bluez_", "omarchy_pixel_call_")
+        )
+    }
+    playback = {
+        item["info"]["output-port-id"] for item in snapshot
+        if item["type"].endswith(":Link")
+        and item["info"]["input-port-id"] in speaker_inputs
+        and item["info"]["output-node-id"] in eligible
+    }
+    return {(port, bus_inputs[0]) for port in playback} | {(monitor_outputs[0], uplink_inputs[0])}
+
+
+class Call:
+    def __init__(self):
+        self.link_owner = str(os.getpid())
+        self.share_module = None
+        self.share_requested = False
+        self.sharing = False
+        self.share_bus = f"omarchy_pixel_call_share_{os.getpid()}"
+        self.echo_module = None
+        self.clean_mic = f"omarchy_pixel_call_mic_{os.getpid()}"
+        self.call_speaker = f"omarchy_pixel_call_speaker_{os.getpid()}"
+        self.mic_muted = False
+        self.mic = None
+        self.connected_at = 0
+        self.last = None
+        self.buffer = b""
+        self.hanging_up = False
+
+    def report(self, state, audio="", error=False, *, in_call=False):
+        payload = {"state": state, "audio": audio, "error": error, "inCall": in_call,
+                   "muted": self.mic_muted, "sharing": self.sharing,
+                   "connectedAt": self.connected_at, "app": snapshot().get("app", ""),
+                   "bluetoothHangup": in_call and can_bluetooth_hangup()}
+        if payload != self.last:
+            print(json.dumps(payload), flush=True)
+            self.last = payload
+
+    def read_mute(self):
+        return run("pactl", "get-source-mute", self.mic).strip().endswith("yes")
+
+    def set_mute(self, enabled):
+        run("pactl", "set-source-mute", self.mic, str(int(enabled)))
+        self.mic_muted = enabled
+
+    def toggle_mute(self):
+        if not self.mic:
+            return
+        current = self.read_mute()
+        self.set_mute(not current)
+
+    def controls(self, wait):
+        if not select.select([sys.stdin], [], [], wait)[0]:
+            return True
+        data = os.read(sys.stdin.fileno(), 4096)
+        if not data:
+            return False
+        self.buffer += data
+        while b"\n" in self.buffer:
+            line, self.buffer = self.buffer.split(b"\n", 1)
+            if line == b"hangup":
+                try:
+                    self.hanging_up = bluetooth_hangup()
+                except (GLib.Error, ValueError):
+                    self.hanging_up = False
+                if not self.hanging_up:
+                    run("notify-send", "Couldn’t end the call", "The Pixel isn’t exposing a single Bluetooth call.")
+            elif line == b"mute":
+                self.toggle_mute()
+            elif line == b"share":
+                self.share_requested = not self.share_requested
+                if not self.share_requested:
+                    self.stop_sharing()
+        return True
+
+    def start_echo_filter(self, mic, speaker):
+        self.echo_module = run(
+            "pactl", "load-module", "module-echo-cancel",
+            "source_master=" + props(mic)["node.name"],
+            "sink_master=" + props(speaker)["node.name"],
+            "source_name=" + self.clean_mic,
+            "sink_name=" + self.call_speaker,
+            "source_properties=priority.session=1",
+            "sink_properties=priority.session=1",
+            "rate=48000", "channels=1", "channel_map=mono", "aec_method=webrtc",
+            'aec_args="webrtc.high_pass_filter=true webrtc.noise_suppression=true webrtc.gain_control=false"',
+        ).strip()
+
+    def start_sharing(self):
+        self.share_module = run(
+            "pactl", "load-module", "module-null-sink",
+            "sink_name=" + self.share_bus, "sink_properties=priority.session=1",
+            "rate=48000", "channels=1", "channel_map=mono",
+        ).strip()
+        try:
+            # Keep headroom when the shared audio is mixed with speech.
+            run("pactl", "set-source-volume", self.share_bus + ".monitor", "60%")
+        except (OSError, subprocess.SubprocessError):
+            self.stop_sharing()
+            raise
+
+    def stop_sharing(self):
+        self.sharing = False
+        self.share_requested = False
+        if self.share_module is not None:
+            module, self.share_module = self.share_module, None
+            try:
+                run("pactl", "unload-module", module)
+            except (OSError, subprocess.SubprocessError):
+                pass
+
+    def route(self):
+        snapshot = graph()
+        mic, speaker, down, up = devices(snapshot)
+        if not mic or not speaker:
+            self.stop_sharing()
+            return "MOTU M4 disconnected"
+        if not down or not up:
+            self.stop_sharing()
+            return "Waiting for Bluetooth audio. Select kipp on the Pixel."
+        if self.echo_module is None:
+            try:
+                self.start_echo_filter(mic, speaker)
+            except (OSError, subprocess.SubprocessError):
+                return "Could not start call echo cancellation. Retrying…"
+            return "Starting echo cancellation…"
+        by_name = {
+            props(item).get("node.name"): item for item in snapshot
+            if item["type"].endswith(":Node")
+        }
+        clean_mic = by_name.get(self.clean_mic)
+        call_speaker = by_name.get(self.call_speaker)
+        if not clean_mic or not call_speaker:
+            return "Starting echo cancellation…"
+        if self.mic is None:
+            run("pactl", "set-source-volume", self.clean_mic, "108%")
+            self.mic = self.clean_mic
+        self.mic_muted = self.read_mute()
+        wanted, call_ports = audio_links(snapshot, clean_mic, call_speaker, down, up)
+        if not wanted:
+            return "Waiting for Bluetooth audio ports…"
+        share_links = set()
+        if self.share_requested and self.share_module is None:
+            self.start_sharing()
+        elif self.share_requested:
+            share_bus = by_name.get(self.share_bus)
+            if share_bus:
+                share_links = computer_audio_links(snapshot, speaker, share_bus, up)
+        all_wanted = wanted | share_links
+
+        existing = {}
+        for link in snapshot:
+            if not link["type"].endswith(":Link"):
+                continue
+            info = link["info"]
+            pair = (info["output-port-id"], info["input-port-id"])
+            is_ours = props(link).get("omarchy.call.owner") == self.link_owner
+            if pair not in all_wanted and (is_ours or call_ports.intersection(pair)):
+                run("pw-link", "-d", str(link["id"]))
+            else:
+                existing[pair] = info["state"]
+        for output, input_ in all_wanted - existing.keys():
+            run("pw-link", "-p", json.dumps({"omarchy.call.owner": self.link_owner}),
+                str(output), str(input_))
+
+        self.sharing = bool(share_links)
+        if all(existing.get(pair) == "active" for pair in wanted):
+            return "Audio connected · MOTU M4 · Echo cancellation"
+        return "Opening Bluetooth audio…"
+
+    def finish(self):
+        self.stop_sharing()
+        try:
+            for item in graph():
+                if item["type"].endswith(":Link") and props(item).get("omarchy.call.owner") == self.link_owner:
+                    run("pw-link", "-d", str(item["id"]))
+        except (OSError, subprocess.SubprocessError):
+            pass
+        if self.echo_module is not None:
+            try:
+                run("pactl", "unload-module", self.echo_module)
+            except (OSError, subprocess.SubprocessError):
+                pass
+
+    def start(self, target):
+        existing = phone_state()
+        if target == "--attach":
+            if not existing:
+                raise ValueError("There’s no active call on the Pixel.")
+        else:
+            number = re.sub(r"[ ()./\-]", "", target)
+            if not re.fullmatch(r"\+?\d{2,30}", number, flags=re.ASCII):
+                raise ValueError("Choose a valid phone number.")
+            if existing:
+                raise ValueError("The Pixel already has a call. Use Current call.")
+            self.report("Dialing", "Connecting to the Pixel…", in_call=True)
+            response = adb("am", "start", "-a", "android.intent.action.CALL", "-d", "tel:" + number)
+            if "Error" in response or "Exception" in response:
+                raise ValueError("The Pixel could not start the call.")
+
+        seen = bool(existing)
+        deadline = time.monotonic() + 30
+        while True:
+            state = phone_state()
+            if not state:
+                if seen or self.hanging_up:
+                    self.report("Call ended")
+                    return
+                if time.monotonic() > deadline:
+                    raise ValueError("The Pixel did not report an active call.")
+                self.report("Dialing", in_call=True)
+            else:
+                seen = True
+                if state == "Connected" and not self.connected_at:
+                    self.connected_at = snapshot().get("connectedAt") or int(time.time() * 1000)
+                try:
+                    audio = self.route()
+                except (OSError, subprocess.SubprocessError):
+                    audio = "Bluetooth audio changed. Retrying…"
+                self.report("Ending call…" if self.hanging_up else state, audio, in_call=True)
+            if not self.controls(0.7):
+                return
+
+
+if __name__ == "__main__":
+    call = Call()
+
+    def stop(_signum, _frame):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, stop)
+    try:
+        call.start(sys.argv[1])
+    except ValueError as exc:
+        call.report(str(exc), error=True)
+    except (OSError, subprocess.SubprocessError):
+        call.report("Could not reach the Pixel or control the call.", error=True)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        call.finish()

@@ -1,0 +1,237 @@
+#!/usr/bin/python3
+"""Read players and address controls to their own D-Bus or PipeWire stream."""
+import json
+import subprocess
+import sys
+
+from gi.repository import Gio, GLib
+
+DBUS = "org.freedesktop.DBus"
+PROPS = DBUS + ".Properties"
+OBJECTS = DBUS + ".ObjectManager"
+MPRIS = "org.mpris.MediaPlayer2"
+MEDIA = MPRIS + ".Player"
+MEDIA_PATH = "/org/mpris/MediaPlayer2"
+BLUEZ = "org.bluez"
+DEVICE = BLUEZ + ".Device1"
+CONTROL = BLUEZ + ".MediaControl1"
+PLAYER = BLUEZ + ".MediaPlayer1"
+SOURCE = "0000110a-0000-1000-8000-00805f9b34fb"
+
+
+def call(bus, name, path, interface, method, format_=None, args=()):
+    variant = GLib.Variant(format_, args) if format_ else None
+    result = bus.call_sync(name, path, interface, method, variant, None,
+                           Gio.DBusCallFlags.NO_AUTO_START, 600, None)
+    return result.unpack()
+
+
+def text(value, fallback=""):
+    return value[:160] if isinstance(value, str) and value.strip() else fallback
+
+
+def app_name(value):
+    # "Mozilla zen" -> "Zen", "mpv" -> "Mpv" stays readable in the mixer.
+    name = value.strip()
+    for prefix in ("Mozilla ", "Google "):
+        if name.startswith(prefix) and len(name) > len(prefix):
+            name = name[len(prefix):]
+    return name[:1].upper() + name[1:]
+
+
+def streams():
+    try:
+        result = subprocess.check_output(["pactl", "-f", "json", "list", "sink-inputs"],
+                                         text=True, timeout=2, stderr=subprocess.DEVNULL)
+        return json.loads(result)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return []
+
+
+def stream_fields(rows):
+    chosen = [row for row in rows if row.get("volume")]
+    if not chosen:
+        return {}
+    active = [row for row in chosen if not row.get("corked") and not row.get("mute")]
+    selected = (active or chosen)[0]
+    values = [channel["value"] for channel in selected["volume"].values()]
+    return {"volume": min(100, round(max(values) * 100 / 65536)),
+            # Tap paused streams too: the analyser is already listening when playback
+            # resumes, so the spectrum rises the instant sound arrives.
+            "taps": [{"index": row["index"], "monitor": row["monitor"]} for row in chosen if row.get("monitor")],
+            "audible": bool(active), "muted": all(row.get("mute") for row in chosen),
+            "sinkInputs": [row["index"] for row in chosen], "streams": chosen}
+
+
+def playback_monitors(rows):
+    try:
+        raw = subprocess.check_output(["pactl", "-f", "json", "list", "sinks"],
+                                      text=True, timeout=2, stderr=subprocess.DEVNULL)
+        monitors = {sink["index"]: sink.get("monitor_source") for sink in json.loads(raw)}
+    except (ValueError, OSError, subprocess.SubprocessError):
+        return rows
+    for row in rows:
+        row["monitor"] = monitors.get(row.get("sink"))
+    return rows
+
+
+def app_groups(rows, claimed):
+    groups = {}
+    for row in rows:
+        if row["index"] in claimed:
+            continue
+        props = row.get("properties", {})
+        node = str(props.get("node.name", ""))
+        if node.startswith(("omarchy_pixel_call_", "echo-cancel", "quickshell-peak-monitor", "tars_calibration_")):
+            continue
+        label = text(props.get("application.name") or props.get("node.description") or props.get("device.description"), node)
+        if not label:
+            continue
+        key = str(props.get("application.id") or f"{label}:{props.get('application.process.binary', node)}")
+        groups.setdefault(key, (label, []))[1].append(row)
+    for key, (label, group) in groups.items():
+        fields = stream_fields(group)
+        if fields:
+            yield {"id": "app:" + key, "name": app_name(label), "media": False, **fields}
+
+
+def desktop_players(bus, rows):
+    seen = set()
+    try:
+        names, = call(bus, DBUS, "/org/freedesktop/DBus", DBUS, "ListNames")
+    except GLib.Error:
+        return
+    for name in sorted(names):
+        if not name.startswith(MPRIS + ".") or name.split(".")[3].lower() in ("kdeconnect", "playerctld"):
+            continue
+        try:
+            owner, = call(bus, DBUS, "/org/freedesktop/DBus", DBUS, "GetNameOwner", "(s)", (name,))
+            if owner in seen:
+                continue
+            seen.add(owner)
+            root, = call(bus, owner, MEDIA_PATH, PROPS, "GetAll", "(s)", (MPRIS,))
+            player, = call(bus, owner, MEDIA_PATH, PROPS, "GetAll", "(s)", (MEDIA,))
+            pid, = call(bus, DBUS, "/org/freedesktop/DBus", DBUS, "GetConnectionUnixProcessID", "(s)", (owner,))
+        except GLib.Error:
+            continue
+        meta = player.get("Metadata") or {}
+        if not player.get("CanControl") or (not meta and player.get("PlaybackStatus") == "Stopped"):
+            continue
+        app = app_name(text(root.get("Identity"), name.split(".")[3]))
+        audio = stream_fields([row for row in rows if
+                               str(row.get("properties", {}).get("application.process.id")) == str(pid)])
+        if not audio:
+            # Some browsers hand audio off to a child process and report the app identity instead.
+            audio = stream_fields([row for row in rows if
+                str(row.get("properties", {}).get("application.name", "")).casefold() == app.casefold()])
+        if not audio and isinstance(player.get("Volume"), (float, int)):
+            audio = {"volume": round(player["Volume"] * 100), "playerVolume": True}
+        yield {"id": name + "@" + owner, "name": app, "title": text(meta.get("xesam:title")),
+               "artist": text(", ".join(a for a in meta.get("xesam:artist", []) if isinstance(a, str))),
+               "playing": player.get("PlaybackStatus") == "Playing", "isPhone": False, "media": True,
+               "play": player.get("CanPlay", False), "pause": player.get("CanPause", False),
+               "next": player.get("CanGoNext", False), "previous": player.get("CanGoPrevious", False),
+               "bus": bus, "dest": owner, "path": MEDIA_PATH, "interface": MEDIA, **audio}
+
+
+def phone_players(bus, rows):
+    try:
+        objects, = call(bus, BLUEZ, "/", OBJECTS, "GetManagedObjects")
+    except GLib.Error:
+        return
+    for path, interfaces in objects.items():
+        device = interfaces.get(DEVICE, {})
+        if not (device.get("Connected") and device.get("Paired") and SOURCE in device.get("UUIDs", [])):
+            continue
+        available = [key for key, values in objects.items()
+                     if PLAYER in values and values[PLAYER].get("Device") == path]
+        chosen = interfaces.get(CONTROL, {}).get("Player")
+        if chosen not in available:
+            if len(available) != 1:
+                continue
+            chosen = available[0]
+        player = objects[chosen][PLAYER]
+        track = player.get("Track") or {}
+        addr = device.get("Address")
+        volume = stream_fields([row for row in rows
+                                 if row.get("properties", {}).get("api.bluez5.address") == addr
+                                 and row["properties"].get("api.bluez5.profile") == "a2dp-source"])
+        yield {"id": chosen, "name": text(device.get("Alias"), "Bluetooth"),
+               "title": text(track.get("Title")), "artist": text(track.get("Artist")),
+               "playing": player.get("Status") == "playing", "isPhone": True, "media": True,
+               "play": True, "pause": True, "next": True, "previous": True,
+               "bus": bus, "dest": BLUEZ, "path": chosen, "interface": PLAYER, **volume}
+
+
+def players():
+    rows = playback_monitors(streams())
+    out = list(desktop_players(Gio.bus_get_sync(Gio.BusType.SESSION, None), rows))
+    try:
+        out.extend(phone_players(Gio.bus_get_sync(Gio.BusType.SYSTEM, None), rows))
+    except GLib.Error:
+        pass
+    claimed = {row["index"] for player in out for row in player.get("streams", [])}
+    out.extend(app_groups(rows, claimed))
+    return sorted(out, key=lambda player: (not player.get("isPhone", False), player["name"].casefold(), player["id"]))
+
+
+def control(player, action, args):
+    if action == "focus" and not args:
+        if not player["media"]:
+            raise ValueError
+        # Starting the new player lets MediaFocus pause the previous one.
+        # Pausing it first looks like a user stop and can restore another player.
+        action = "pause" if player["playing"] else "play"
+    if action == "toggle" and not args:
+        if player["media"]:
+            action = "pause" if player["playing"] else "play"
+        else:
+            target = "0" if player["muted"] else "1"
+            for row in player["streams"]:
+                subprocess.run(["pactl", "set-sink-input-mute", str(row["index"]), target],
+                               check=True, timeout=2, stderr=subprocess.DEVNULL)
+            return
+    if action == "volume":
+        if len(args) != 1 or not args[0].isascii() or not args[0].isdigit():
+            raise ValueError
+        requested = int(args[0])
+        if not 0 <= requested <= 100:
+            raise ValueError
+        if player.get("streams"):
+            for row in player["streams"]:
+                original = [channel["value"] for channel in row["volume"].values()]
+                peak = max(original)
+                target = round(requested * 65536 / 100)
+                values = [round(value * target / peak) if peak else target for value in original]
+                subprocess.run(["pactl", "set-sink-input-volume", str(row["index"]), *map(str, values)],
+                               check=True, timeout=2, stderr=subprocess.DEVNULL)
+        elif player.get("playerVolume"):
+            call(player["bus"], player["dest"], player["path"], PROPS, "Set", "(ssv)",
+                 (MEDIA, "Volume", GLib.Variant("d", requested / 100)))
+        else:
+            raise ValueError
+    elif not args and action in ("play", "pause", "next", "previous") and player.get(action):
+        call(player["bus"], player["dest"], player["path"], player["interface"], action.capitalize())
+    else:
+        raise ValueError
+
+
+def main(args):
+    found = players()
+    if args == ["list"]:
+        public = ("id", "name", "title", "artist", "playing", "isPhone", "play", "pause", "next", "previous", "volume", "media", "taps", "audible", "muted", "sinkInputs")
+        print(json.dumps([{k: p[k] for k in public if k in p} for p in found[:16]]))
+    elif len(args) >= 2:
+        player = next((p for p in found if p["id"] == args[1]), None)
+        if player is None:
+            raise ValueError
+        control(player, args[0], args[2:])
+    else:
+        raise ValueError
+
+
+if __name__ == "__main__":
+    try:
+        main(sys.argv[1:])
+    except (ValueError, OSError, GLib.Error, subprocess.SubprocessError):
+        sys.exit(1)

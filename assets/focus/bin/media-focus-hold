@@ -1,0 +1,8 @@
+#!/usr/bin/python3
+from pathlib import Path
+import sys
+
+root = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(root if (root / "media_focus").is_dir() else root / "lib/omarchy-media-focus"))
+from media_focus.hold import main
+sys.exit(main())

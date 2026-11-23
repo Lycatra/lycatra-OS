@@ -1,0 +1,79 @@
+#!/usr/bin/python3
+"""Enable or park the Pixel's paired Bluetooth connection without unpairing."""
+
+import os
+import re
+import subprocess
+import sys
+
+from gi.repository import Gio, GLib
+
+BLUEZ = "org.bluez"
+DEVICE = BLUEZ + ".Device1"
+ADAPTER = BLUEZ + ".Adapter1"
+PROPS = "org.freedesktop.DBus.Properties"
+PIXEL_ADDRESS = os.environ.get("LYCATRA_PHONE_BLUETOOTH", "")
+PIXEL_ADB = os.environ.get("LYCATRA_PHONE_ADB", "")
+
+
+def call(bus, path, interface, method, params=None, timeout=1500):
+    return bus.call_sync(BLUEZ, path, interface, method, params, None,
+                         Gio.DBusCallFlags.NO_AUTO_START, timeout, None).unpack()
+
+
+def local_device(bus):
+    objects, = call(bus, "/", "org.freedesktop.DBus.ObjectManager", "GetManagedObjects")
+    for path, interfaces in objects.items():
+        device = interfaces.get(DEVICE, {})
+        if device.get("Address") == PIXEL_ADDRESS and device.get("Paired"):
+            adapter = objects.get(device["Adapter"], {}).get(ADAPTER, {})
+            return path, device, adapter.get("Address", "")
+    return "", {}, ""
+
+
+def media_selected(address):
+    if not address:
+        return False
+    result = subprocess.run(["adb", "-s", PIXEL_ADB, "shell", "dumpsys", "bluetooth_manager"],
+                            text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                            timeout=1.0, check=True)
+    profile = re.search(r"(?ms)^Profile: A2dpService\s*\n(.*?)(?=^Profile:|\Z)", result.stdout)
+    if not profile:
+        return False
+    selected = re.search(r"(?mi)^\s*mActiveDevice:\s*((?:[\da-fx]{2}:){5}[\da-fx]{2})\s*$",
+                         profile[1])
+    # Android redacts the first four octets of the active Bluetooth address.
+    return bool(selected and selected[1].upper()[-5:] == address.upper()[-5:])
+
+
+def main(action):
+    bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+    path, device, address = local_device(bus)
+    if action == "media-selected":
+        return 0 if path and not device.get("Blocked") and media_selected(address) else 1
+    if not path:
+        print("unavailable")
+        return 1
+    if action in {"on", "off"}:
+        call(bus, path, PROPS, "Set",
+             GLib.Variant("(ssv)", (DEVICE, "Blocked", GLib.Variant("b", action == "off"))))
+        if action == "on" and not device.get("Connected"):
+            try:
+                call(bus, path, DEVICE, "Connect", timeout=9000)
+            except GLib.Error:
+                # The phone can connect from its Bluetooth menu when it comes into range.
+                pass
+        _, device, _ = local_device(bus)
+    print("off" if device.get("Blocked") else "connected" if device.get("Connected") else "available")
+    return 0
+
+
+if __name__ == "__main__":
+    if len(sys.argv) != 2 or sys.argv[1] not in {"status", "on", "off", "media-selected"}:
+        raise SystemExit("Usage: pixel-audio status|on|off|media-selected")
+    try:
+        raise SystemExit(main(sys.argv[1]))
+    except (GLib.Error, OSError, subprocess.SubprocessError):
+        if sys.argv[1] != "media-selected":
+            print("unavailable")
+        raise SystemExit(1)

@@ -1,0 +1,9 @@
+[Unit]
+Description=Release Omarchy media focus when Superwhisper stops recording
+BindsTo=omarchy-dictation-focus.service superwhisper.service
+After=omarchy-dictation-focus.service superwhisper.service
+
+[Service]
+Type=exec
+ExecStart=%h/.local/bin/dictation-focus-watch
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin

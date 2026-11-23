@@ -1,0 +1,11 @@
+[Unit]
+Description=Hold media playback during dictation
+Requires=omarchy-media-focus.service
+After=omarchy-media-focus.service
+PartOf=graphical-session.target
+
+[Service]
+Type=notify
+ExecStart=%h/.local/bin/media-focus-hold --wait
+TimeoutStartSec=4
+TimeoutStopSec=3

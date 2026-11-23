@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "id": "local.keyboard-layout-popup",
+  "name": "Keyboard layout popup",
+  "version": "1.0.0",
+  "description": "Shows the active keyboard layout when it changes.",
+  "kinds": ["service"],
+  "keepLoaded": true,
+  "entryPoints": {"service": "Service.qml"}
+}

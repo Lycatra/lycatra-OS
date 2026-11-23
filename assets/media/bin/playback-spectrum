@@ -1,0 +1,114 @@
+#!/usr/bin/python3
+"""Stream a log-frequency spectrum (bass left, treble right) for one playback stream.
+
+Each line is a JSON list of BANDS levels in 0..100, or [] when the stream is silent.
+Pure Python on purpose: a 512-point FFT at 25 fps costs a few percent of one core.
+"""
+from array import array
+import cmath
+import json
+import math
+import signal
+import subprocess
+import sys
+
+RATE = 16000
+HOP = RATE // 25            # 25 frames per second
+SIZE = 512                  # FFT window (32 ms)
+BANDS = 48
+LOW, HIGH = 40.0, 7600.0
+FLOOR_DB = -58.0            # maps to 0
+CEIL_DB = -2.0              # maps to 100
+
+WINDOW = [0.5 - 0.5 * math.cos(2 * math.pi * i / (SIZE - 1)) for i in range(SIZE)]
+# Full-scale sine through a Hann window peaks at amplitude * SIZE / 4.
+REFERENCE = 32768 * SIZE / 4
+BITS = SIZE.bit_length() - 1
+REVERSED = [int(format(i, f"0{BITS}b")[::-1], 2) for i in range(SIZE)]
+TWIDDLES = {}
+size = 2
+while size <= SIZE:
+    TWIDDLES[size] = [cmath.exp(-2j * math.pi * k / size) for k in range(size // 2)]
+    size *= 2
+
+
+def fft(values):
+    data = [complex(values[i]) for i in REVERSED]
+    size = 2
+    while size <= SIZE:
+        half = size // 2
+        twiddles = TWIDDLES[size]
+        for start in range(0, SIZE, size):
+            for k in range(half):
+                a = start + k
+                b = a + half
+                t = twiddles[k] * data[b]
+                data[b] = data[a] - t
+                data[a] = data[a] + t
+        size *= 2
+    return data
+
+
+def band_edges():
+    step = RATE / SIZE
+    edges = []
+    for band in range(BANDS):
+        lo = LOW * (HIGH / LOW) ** (band / BANDS)
+        hi = LOW * (HIGH / LOW) ** ((band + 1) / BANDS)
+        first = max(1, int(lo / step))
+        last = max(first + 1, int(math.ceil(hi / step)))
+        centre = math.sqrt(lo * hi)
+        # Music falls off ~3 dB/octave; tilt it back so the treble is visible.
+        tilt = 3.0 * math.log2(centre / 500.0)
+        edges.append((first, min(last, SIZE // 2), tilt))
+    return edges
+
+
+EDGES = band_edges()
+
+
+def spectrum(samples):
+    bins = fft([s * w for s, w in zip(samples, WINDOW)])
+    power = [abs(b) for b in bins[:SIZE // 2 + 1]]
+    out = []
+    for first, last, tilt in EDGES:
+        magnitude = max(power[first:last])
+        db = 20 * math.log10(magnitude / REFERENCE + 1e-9) + tilt
+        out.append(max(0, min(100, round((db - FLOOR_DB) * 100 / (CEIL_DB - FLOOR_DB)))))
+    return out
+
+
+def stop(*_):
+    raise SystemExit
+
+
+def main(index, monitor):
+    if not index.isascii() or not index.isdecimal() or not monitor.endswith(".monitor"):
+        return 1
+    signal.signal(signal.SIGTERM, stop)
+    args = ["parec", "--raw", "--client-name=Omarchy spectrum",
+            "--stream-name=Playback spectrum", "--monitor-stream=" + index,
+            "--device=" + monitor, "--format=s16ne", "--channels=1",
+            "--rate=" + str(RATE), "--latency-msec=30"]
+    reader = subprocess.Popen(args, stdout=subprocess.PIPE)
+    history = array("h", [0] * SIZE)
+    try:
+        silent = False
+        while len(data := reader.stdout.read(HOP * 2)) == HOP * 2:
+            history = (history + array("h", data))[-SIZE:]
+            quiet = max(map(abs, history)) <= 24
+            if not quiet or not silent:
+                line = [] if quiet else spectrum(history)
+                print(json.dumps(line, separators=(",", ":")), flush=True)
+            silent = quiet
+    finally:
+        reader.terminate()
+        reader.stdout.close()
+        reader.wait()
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(*sys.argv[1:]))
+    except BrokenPipeError:
+        pass

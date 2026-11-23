@@ -1,0 +1,233 @@
+#!/usr/bin/env python3
+import argparse
+import contextlib
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import urllib.request
+import venv
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+import manage
+import search
+
+
+def setup_model():
+    base = search.MODEL
+    base.mkdir(mode=0o700, parents=True, exist_ok=True)
+    runtime = base / "venv"
+    if not (runtime / "bin/python").exists():
+        venv.create(runtime, with_pip=True)
+    subprocess.run(
+        [
+            str(runtime / "bin/python"),
+            "-m",
+            "pip",
+            "install",
+            "--only-binary=:all:",
+            "-r",
+            str(manage.ROOT / "requirements.lock"),
+        ],
+        check=True,
+    )
+    rev = "614241f622f53c4eeff9890bdc4f31cfecc418b3"
+    for name, digest in [
+        (
+            "onnx/model.onnx",
+            "ca456c06b3a9505ddfd9131408916dd79290368331e7d76bb621f1cba6bc8665",
+        ),
+        (
+            "tokenizer.json",
+            "0b44a9d7b51c3c62626640cda0e2c2f70fdacdc25bbbd68038369d14ebdf4c39",
+        ),
+    ]:
+        target = base / Path(name).name
+        if target.exists():
+            with target.open("rb") as f:
+                if hashlib.file_digest(f, "sha256").hexdigest() == digest:
+                    continue
+        with tempfile.NamedTemporaryFile(dir=base, delete=False) as f:
+            tmp = Path(f.name)
+            try:
+                with urllib.request.urlopen(
+                    f"https://huggingface.co/intfloat/multilingual-e5-small/resolve/{rev}/{name}",
+                    timeout=60,
+                ) as stream:
+                    shutil.copyfileobj(stream, f)
+                f.flush()
+                with tmp.open("rb") as verify:
+                    if hashlib.file_digest(verify, "sha256").hexdigest() != digest:
+                        raise ValueError("Model checksum mismatch")
+                os.replace(tmp, target)
+            finally:
+                tmp.unlink(missing_ok=True)
+
+
+def main():
+    os.umask(0o077)
+    p = argparse.ArgumentParser()
+    sub = p.add_subparsers(dest="op", required=True)
+    for op in ("inspect", "plan", "apply", "verify", "update", "remove", "rollback"):
+        cmd = sub.add_parser(op)
+        cmd.add_argument("components", nargs="*")
+        cmd.add_argument(
+            "--stage",
+            action="store_true",
+            help="Materialize files without activating desktop services",
+        )
+        cmd.add_argument("--json", action="store_true")
+        if op in ("apply", "update"):
+            cmd.add_argument(
+                "--install-deps",
+                action="store_true",
+                help="Install missing system packages through Omarchy",
+            )
+    sub.add_parser("catalog")
+    sub.add_parser("model-install")
+    sub.add_parser("serve")
+    sub.add_parser("session-watch")
+    sub.add_parser("status")
+    for op in ("pause", "resume", "reindex", "webapp"):
+        sub.add_parser(op)
+    q = sub.add_parser("query")
+    q.add_argument("stage", choices=["lexical", "semantic", "wiki"])
+    q.add_argument("phrase")
+    sub.add_parser("open").add_argument("result", nargs=2)
+    conf = sub.add_parser("configure")
+    conf.add_argument("--wiki", choices=["on", "off"])
+    conf.add_argument("--root", action="append")
+    conf.add_argument("--exclude", action="append")
+    a = p.parse_args()
+    if a.op == "catalog":
+        return manage.CAT
+    if a.op == "model-install":
+        setup_model()
+        return {"model": "multilingual-e5-small"}
+    if a.op == "query":
+        return search.search(a.stage, a.phrase)
+    if a.op == "open":
+        search.open_result(*a.result)
+    if a.op == "webapp":
+        app = shutil.which("omarchy-launch-webapp-helium") or shutil.which(
+            "omarchy-launch-webapp"
+        )
+        if not app:
+            raise ValueError("Missing Omarchy web-app launcher")
+        os.execl(app, app, "https://lycatra.com/", "--new-window")
+    if a.op == "session-watch":
+        return search.session_watch()
+    if a.op == "serve":
+        py = search.MODEL / "venv/bin/python"
+        if py.exists() and Path(sys.prefix) != py.parents[1]:
+            os.execv(py, [str(py), str(Path(__file__).resolve()), "serve"])
+        return search.serve()
+    if a.op == "configure":
+        cfg = search.settings()
+        for key, values in [("roots", a.root), ("exclude", a.exclude)]:
+            if values is not None:
+                cfg[key] = [str(Path(v).expanduser().resolve()) for v in values]
+        if a.wiki:
+            cfg["wiki"] = a.wiki == "on"
+            cfg["wiki_session"] = search.session_signature() if cfg["wiki"] else None
+            if cfg["wiki"] and (not cfg["wiki_session"] or not shutil.which("lycatra")):
+                raise ValueError(
+                    "Sign in with lycatra login before enabling wiki search."
+                )
+        manage.save(search.CONFIG, cfg)
+        return cfg
+    if a.op in ("pause", "resume"):
+        manage.run(
+            "systemctl",
+            "--user",
+            "stop" if a.op == "pause" else "start",
+            "lycatra-search.service",
+        )
+        return {"paused": a.op == "pause"}
+    if a.op in ("status", "reindex"):
+        with contextlib.closing(search.connect()) as db:
+            search.initialize(db)
+            if a.op == "reindex":
+                with db:
+                    db.execute("UPDATE files SET done=0")
+                    db.execute("DELETE FROM passages")
+            return dict(
+                files=db.execute("SELECT count(*) FROM files").fetchone()[0],
+                pending=db.execute(
+                    "SELECT count(*) FROM files WHERE done=0"
+                ).fetchone()[0],
+                passages=db.execute("SELECT count(*) FROM passages").fetchone()[0],
+                model=(search.MODEL / "model.onnx").exists(),
+                wiki=search.settings().get("wiki", False),
+            )
+    if a.op == "apply" and not a.components and not manage.RECEIPT.exists():
+        if not sys.stdin.isatty():
+            raise ValueError("Choose components explicitly, or select studio")
+        for k, v in manage.CAT.items():
+            print(f"{k:12} {v['description']}", file=sys.stderr)
+        a.components = input(
+            "Choose components (space-separated), or studio for all: "
+        ).split()
+        if not a.components:
+            raise ValueError("No components selected")
+    if a.op in ("apply", "update") and not a.stage:
+        plan = manage.manage("plan", a.components, True)
+        if plan["missing_commands"] and not plan["conflicts"]:
+            packages = json.loads((manage.ROOT / "catalog.json").read_text())[
+                "packages"
+            ]
+            wanted = sorted({packages[name] for name in plan["missing_commands"]})
+            approved = a.install_deps or (
+                sys.stdin.isatty()
+                and input("Install " + ", ".join(wanted) + " with Omarchy? [y/N] ")
+                .strip()
+                .lower()
+                == "y"
+            )
+            if approved:
+                if "superwhisper-bin" in wanted:
+                    subprocess.run(
+                        [
+                            "omarchy",
+                            "install",
+                            "dictation",
+                            "superwhisper",
+                            "--background",
+                        ],
+                        check=True,
+                    )
+                    wanted.remove("superwhisper-bin")
+                if wanted:
+                    subprocess.run(["omarchy", "pkg", "add", *wanted], check=True)
+                plan = manage.manage("plan", a.components, True)
+        if plan["missing_commands"] or plan["conflicts"]:
+            raise ValueError(json.dumps(plan))
+        if (
+            "search" in plan["selected"]
+            and not (search.MODEL / "tokenizer.json").exists()
+        ):
+            setup_model()
+    result = manage.manage(a.op, a.components, a.stage)
+    if a.op == "verify" and (
+        result.get("inactive")
+        or result["changes"]
+        or result["conflicts"]
+        or (result["missing_commands"] and not a.stage)
+    ):
+        print(json.dumps(result))
+        raise SystemExit(1)
+    return result
+
+
+if __name__ == "__main__":
+    try:
+        result = main()
+        if result is not None:
+            print(json.dumps(result, ensure_ascii=True))
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(1)
